@@ -25,6 +25,38 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const messageId = msg.message_id;
 
+  // Check if the message contains a story
+  if (msg.story) {
+    console.log('Message contains a story, marking for deletion and banning user.');
+
+    // Log details about the story
+    const storyChat = msg.story.chat || {};
+    const storyDetails = `Shared story from @${storyChat.username || 'unknown'}: "${storyChat.title || 'No Title'}"`;
+
+    // Attempt to delete and ban the user
+    try {
+      // Delete the message
+      console.log('Deleting the story...');
+      await bot.deleteMessage(chatId, messageId);
+      console.log('Message deleted successfully.');
+
+      // Notify the deleted messages group
+      await bot.sendMessage(
+        deletedMessagesChatId,
+        `Deleted story or media post from user: ${msg.from.username || msg.from.first_name}\nDetails:\n${storyDetails}`
+      );
+      console.log('Notified deleted messages group.');
+
+      // Ban the user
+      console.log(`Banning user: ${msg.from.username || msg.from.first_name} (ID: ${msg.from.id})`);
+      await bot.banChatMember(chatId, msg.from.id);
+      console.log('User banned successfully.');
+    } catch (error) {
+      console.error('Failed to delete story or ban user:', error);
+    }
+    return;
+  }
+
   // Determine the content to check: caption or text
   const messageContent = msg.caption || msg.text;
 
