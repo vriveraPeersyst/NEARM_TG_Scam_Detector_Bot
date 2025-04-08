@@ -87,8 +87,8 @@ bot.on('message', async (msg) => {
       const chatMember = await bot.getChatMember(chatId, msg.from.id);
       console.log('Sender status:', chatMember.status);
 
-      if (['administrator', 'creator'].includes(chatMember.status)) {
-        console.log('Message is from an admin or group creator, skipping deletion and banning.');
+      if (['administrator', 'creator', 'owner'].includes(chatMember.status)) {
+        console.log('Message is from an admin, owner or group creator, skipping deletion and banning.');
         return;
       }
 
