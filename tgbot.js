@@ -2,52 +2,69 @@ const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
 require('dotenv').config();
 
+// Required environment variables
+const {
+  TELEGRAM_BOT_TOKEN,
+  OPENAI_API_KEY,
+  SUPPORT_GROUP_CHAT_ID,
+  DELETED_GROUP_CHAT_ID,
+  OWNER_USER_ID
+} = process.env;
+
+if (!TELEGRAM_BOT_TOKEN || !OPENAI_API_KEY || !SUPPORT_GROUP_CHAT_ID || !DELETED_GROUP_CHAT_ID || !OWNER_USER_ID) {
+  console.error('⛔ Missing required .env values. Ensure TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, SUPPORT_GROUP_CHAT_ID, DELETED_GROUP_CHAT_ID, and OWNER_USER_ID are set.');
+  process.exit(1);
+}
+
+// Parse owner ID as integer
+const OWNER_ID = parseInt(OWNER_USER_ID, 10);
+if (isNaN(OWNER_ID)) {
+  console.error('⛔ OWNER_USER_ID must be a valid Telegram user ID integer');
+  process.exit(1);
+}
+
 // Initialize the Telegram bot
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
 // Initialize OpenAI API
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// Replace with the chat ID of the NEARMobile Telegram support group
-const nearMobileSupportChatId = process.env.SUPPORT_GROUP_CHAT_ID; // Replace with the actual chat ID
+// Chat IDs
+const nearMobileSupportChatId = SUPPORT_GROUP_CHAT_ID;
+const deletedMessagesChatId   = DELETED_GROUP_CHAT_ID;
 
-// Replace with the chat ID of the "DELETED | NEARMobile" group
-const deletedMessagesChatId = process.env.DELETED_GROUP_CHAT_ID; // Replace with actual chat ID
-
-// Log when the bot starts
 console.log('Telegram bot is running...');
 
 bot.on('message', async (msg) => {
-  console.log('Received message object:', msg); // Log the full message object for debugging
+  console.log('Received message object:', msg);
 
   const chatId = msg.chat.id;
   const messageId = msg.message_id;
 
-  // Check if the message contains a story
+  // Always skip messages from the owner
+  if (msg.from.id === OWNER_ID) {
+    console.log(`Message from OWNER (${msg.from.username || msg.from.first_name}), skipping moderation.`);
+    return;
+  }
+
+  // Handle stories/media posts
   if (msg.story) {
     console.log('Message contains a story, marking for deletion and banning user.');
 
-    // Log details about the story
     const storyChat = msg.story.chat || {};
     const storyDetails = `Shared story from @${storyChat.username || 'unknown'}: "${storyChat.title || 'No Title'}"`;
 
-    // Attempt to delete and ban the user
     try {
-      // Delete the message
       console.log('Deleting the story...');
       await bot.deleteMessage(chatId, messageId);
       console.log('Message deleted successfully.');
 
-      // Notify the deleted messages group
       await bot.sendMessage(
         deletedMessagesChatId,
         `Deleted story or media post from user: ${msg.from.username || msg.from.first_name}\nDetails:\n${storyDetails}`
       );
       console.log('Notified deleted messages group.');
 
-      // Ban the user
       console.log(`Banning user: ${msg.from.username || msg.from.first_name} (ID: ${msg.from.id})`);
       await bot.banChatMember(chatId, msg.from.id);
       console.log('User banned successfully.');
@@ -59,36 +76,29 @@ bot.on('message', async (msg) => {
 
   // Determine the content to check: caption or text
   const messageContent = msg.caption || msg.text;
-
   if (!messageContent) {
     console.log('Non-text or captionless message received, ignoring.');
     return;
   }
 
-  console.log('Support group chat ID:', nearMobileSupportChatId);
-  console.log('Deleted group chat ID:', deletedMessagesChatId);
-
-  // Check if the message is from the NEARMobile support group
+  // Ensure this is the support group
   if (chatId.toString() !== nearMobileSupportChatId.toString()) {
     console.log(`Message from an untracked group (${chatId}) ignored.`);
     return;
   }
 
-  // Log the received message
   console.log(`New message received from ${msg.from.username || msg.from.first_name}: ${messageContent}`);
 
-  // Detect the message type with retry logic
+  // Classify message type with retries
   try {
-    const messageType = await retryDetectMessageType(messageContent, 3); // Retry up to 3 times
+    const messageType = await retryDetectMessageType(messageContent, 3);
     console.log('Message type detected:', messageType);
 
-    if (['delete'].includes(messageType)) {
-      // Check the sender's status in the group
+    if (messageType === 'delete') {
+      // Skip administrators and creator
       const chatMember = await bot.getChatMember(chatId, msg.from.id);
-      console.log('Sender status:', chatMember.status);
-
       if (['administrator', 'creator', 'owner'].includes(chatMember.status)) {
-        console.log('Message is from an admin, owner or group creator, skipping deletion and banning.');
+        console.log('Message is from an admin/creator, skipping deletion and banning.');
         return;
       }
 
@@ -96,7 +106,6 @@ bot.on('message', async (msg) => {
       await bot.deleteMessage(chatId, messageId);
       console.log('Message deleted successfully');
 
-      // Forward the deleted message to the "DELETED | NEARMobile" group
       try {
         console.log('Forwarding deleted message to the deleted messages group...');
         await bot.sendMessage(
@@ -104,10 +113,9 @@ bot.on('message', async (msg) => {
           `Deleted and banned user: ${msg.from.username || msg.from.first_name}\nMessage:\n\n${messageContent}`
         );
       } catch (error) {
-        console.error('Failed to forward the deleted message to the group:', error);
+        console.error('Failed to forward the deleted message:', error);
       }
 
-      // Ban the user from the group
       console.log(`Banning user: ${msg.from.username || msg.from.first_name} (ID: ${msg.from.id})`);
       await bot.banChatMember(chatId, msg.from.id);
       console.log('User banned successfully');
@@ -117,27 +125,22 @@ bot.on('message', async (msg) => {
   }
 });
 
-// Function to detect message type with retry logic
+// Retry wrapper for classification
 async function retryDetectMessageType(messageContent, retries) {
   let attempts = 0;
-
   while (attempts < retries) {
+    attempts++;
+    console.log(`Attempt ${attempts}: Detecting message type for: "${messageContent}"`);
     try {
-      attempts++;
-      console.log(`Attempt ${attempts}: Detecting message type for: "${messageContent}"`);
-
       const messageType = await detectMessageType(messageContent);
-
       if (['delete', 'normal'].includes(messageType)) {
-        return messageType; // Valid result
+        return messageType;
       }
-
       console.log(`Unexpected result: "${messageType}". Retrying...`);
     } catch (error) {
       console.error(`Error during attempt ${attempts}:`, error);
     }
   }
-
   throw new Error(`Failed to classify message after ${retries} attempts`);
 }
 
@@ -183,10 +186,13 @@ Evaluate each message based on these criteria and classify accordingly. The prom
         { role: 'user', content: messageContent },
       ],
     });
-
     return completion.choices[0].message.content.trim().toLowerCase();
   } catch (error) {
     console.error('Error during OpenAI API call:', error);
     throw error;
   }
 }
+
+// Prevent the process from crashing on unhandled errors
+process.on('uncaughtException', err => console.error('uncaughtException:', err));
+process.on('unhandledRejection', err => console.error('unhandledRejection:', err));
