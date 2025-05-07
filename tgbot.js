@@ -2,7 +2,23 @@ const TelegramBot = require('node-telegram-bot-api');
 const OpenAI = require('openai');
 require('dotenv').config();
 
-// Required environment variables
+// 1. List all required env-vars
+const requiredEnv = [
+  'TELEGRAM_BOT_TOKEN',
+  'OPENAI_API_KEY',
+  'SUPPORT_GROUP_CHAT_ID',
+  'DELETED_GROUP_CHAT_ID',
+  'OWNER_USER_ID'
+];
+
+// 2. Check which ones are missing
+const missing = requiredEnv.filter(key => !process.env[key]);
+if (missing.length) {
+  console.error(`⛔ Missing required .env values: ${missing.join(', ')}`);
+  process.exit(1);
+}
+
+// 3. Safe to destructure now
 const {
   TELEGRAM_BOT_TOKEN,
   OPENAI_API_KEY,
@@ -11,25 +27,17 @@ const {
   OWNER_USER_ID
 } = process.env;
 
-if (!TELEGRAM_BOT_TOKEN || !OPENAI_API_KEY || !SUPPORT_GROUP_CHAT_ID || !DELETED_GROUP_CHAT_ID || !OWNER_USER_ID) {
-  console.error('⛔ Missing required .env values. Ensure TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, SUPPORT_GROUP_CHAT_ID, DELETED_GROUP_CHAT_ID, and OWNER_USER_ID are set.');
-  process.exit(1);
-}
-
-// Parse owner ID as integer
+// 4. Validate OWNER_USER_ID is an integer
 const OWNER_ID = parseInt(OWNER_USER_ID, 10);
 if (isNaN(OWNER_ID)) {
   console.error('⛔ OWNER_USER_ID must be a valid Telegram user ID integer');
   process.exit(1);
 }
 
-// Initialize the Telegram bot
+// 5. Initialize bots and APIs
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-
-// Initialize OpenAI API
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// Chat IDs
 const nearMobileSupportChatId = SUPPORT_GROUP_CHAT_ID;
 const deletedMessagesChatId   = DELETED_GROUP_CHAT_ID;
 
@@ -38,20 +46,20 @@ console.log('Telegram bot is running...');
 bot.on('message', async (msg) => {
   console.log('Received message object:', msg);
 
-  const chatId = msg.chat.id;
+  const chatId    = msg.chat.id;
   const messageId = msg.message_id;
 
-  // Always skip messages from the owner
+  // Skip messages from the owner
   if (msg.from.id === OWNER_ID) {
     console.log(`Message from OWNER (${msg.from.username || msg.from.first_name}), skipping moderation.`);
     return;
   }
 
-  // Handle stories/media posts
+  // ----- Handle stories/media posts -----
   if (msg.story) {
     console.log('Message contains a story, marking for deletion and banning user.');
 
-    const storyChat = msg.story.chat || {};
+    const storyChat    = msg.story.chat || {};
     const storyDetails = `Shared story from @${storyChat.username || 'unknown'}: "${storyChat.title || 'No Title'}"`;
 
     try {
@@ -74,14 +82,14 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // Determine the content to check: caption or text
+  // ----- Handle normal text/caption messages -----
   const messageContent = msg.caption || msg.text;
   if (!messageContent) {
     console.log('Non-text or captionless message received, ignoring.');
     return;
   }
 
-  // Ensure this is the support group
+  // Only moderate in the designated support group
   if (chatId.toString() !== nearMobileSupportChatId.toString()) {
     console.log(`Message from an untracked group (${chatId}) ignored.`);
     return;
@@ -89,13 +97,12 @@ bot.on('message', async (msg) => {
 
   console.log(`New message received from ${msg.from.username || msg.from.first_name}: ${messageContent}`);
 
-  // Classify message type with retries
   try {
     const messageType = await retryDetectMessageType(messageContent, 3);
     console.log('Message type detected:', messageType);
 
     if (messageType === 'delete') {
-      // Skip administrators and creator
+      // Skip admins/creator
       const chatMember = await bot.getChatMember(chatId, msg.from.id);
       if (['administrator', 'creator', 'owner'].includes(chatMember.status)) {
         console.log('Message is from an admin/creator, skipping deletion and banning.');
@@ -125,7 +132,7 @@ bot.on('message', async (msg) => {
   }
 });
 
-// Retry wrapper for classification
+// Retry wrapper
 async function retryDetectMessageType(messageContent, retries) {
   let attempts = 0;
   while (attempts < retries) {
@@ -144,7 +151,7 @@ async function retryDetectMessageType(messageContent, retries) {
   throw new Error(`Failed to classify message after ${retries} attempts`);
 }
 
-// Function to detect message type
+// OpenAI classification call
 async function detectMessageType(messageContent) {
   try {
     console.log(`Prompting OpenAI to classify message: "${messageContent}"`);
@@ -180,11 +187,11 @@ Examples of messages to classify as "normal":
 - "Is there a way to resolve a stuck transaction?"
 - "I have an issue logging into my NEARMobile wallet. Can anyone help?"
 
-Evaluate each message based on these criteria and classify accordingly. The prompt output can only be "delete" or "normal"
-`,
+Evaluate each message based on these criteria and classify accordingly. The prompt output can only be "delete" or "normal".
+`
         },
-        { role: 'user', content: messageContent },
-      ],
+        { role: 'user', content: messageContent }
+      ]
     });
     return completion.choices[0].message.content.trim().toLowerCase();
   } catch (error) {
@@ -193,6 +200,6 @@ Evaluate each message based on these criteria and classify accordingly. The prom
   }
 }
 
-// Prevent the process from crashing on unhandled errors
+// Prevent crashes on unhandled errors
 process.on('uncaughtException', err => console.error('uncaughtException:', err));
 process.on('unhandledRejection', err => console.error('unhandledRejection:', err));
