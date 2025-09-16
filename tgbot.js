@@ -173,7 +173,7 @@ Guidelines:
    - Messages mentioning specific financial instruments (e.g., TON, LTC, leverage).
 
 2. Classify as "normal" if the message:
-   - Asks legitimate questions about the NEARMobile wallet or related issues.
+   - Asks legitimate questions about the NEARMobile wallet, NEAR, NPRO or related issues.
    - Seeks technical help or guidance about wallet interactions.
    - Shares community-related updates, events, or discussions about the NEAR ecosystem.
 
@@ -184,6 +184,7 @@ Examples of messages to classify as "delete":
 
 Examples of messages to classify as "normal":
 - "How can I transfer funds using the NEARMobile wallet?"
+- "How can I earn NPRO tokens?"
 - "Is there a way to resolve a stuck transaction?"
 - "I have an issue logging into my NEARMobile wallet. Can anyone help?"
 
