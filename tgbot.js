@@ -11,6 +11,11 @@ const requiredEnv = [
   'OWNER_USER_ID'
 ];
 
+// Optional whitelist of user IDs to never moderate
+const optionalEnv = [
+  'WHITELIST_USER_IDS'
+];
+
 // 2. Check which ones are missing
 const missing = requiredEnv.filter(key => !process.env[key]);
 if (missing.length) {
@@ -24,7 +29,8 @@ const {
   OPENAI_API_KEY,
   SUPPORT_GROUP_CHAT_ID,
   DELETED_GROUP_CHAT_ID,
-  OWNER_USER_ID
+  OWNER_USER_ID,
+  WHITELIST_USER_IDS
 } = process.env;
 
 // 4. Validate OWNER_USER_ID is an integer
@@ -32,6 +38,22 @@ const OWNER_ID = parseInt(OWNER_USER_ID, 10);
 if (isNaN(OWNER_ID)) {
   console.error('⛔ OWNER_USER_ID must be a valid Telegram user ID integer');
   process.exit(1);
+}
+
+// 5. Parse whitelist user IDs (optional)
+let WHITELIST_IDS = [];
+if (WHITELIST_USER_IDS) {
+  try {
+    WHITELIST_IDS = WHITELIST_USER_IDS.split(',')
+      .map(id => parseInt(id.trim(), 10))
+      .filter(id => !isNaN(id));
+    console.log(`✅ Whitelist configured with ${WHITELIST_IDS.length} user IDs:`, WHITELIST_IDS);
+  } catch (error) {
+    console.error('⚠️ Invalid WHITELIST_USER_IDS format. Using empty whitelist.');
+    WHITELIST_IDS = [];
+  }
+} else {
+  console.log('ℹ️ No whitelist configured (WHITELIST_USER_IDS not set)');
 }
 
 // 5. Initialize bots and APIs
@@ -43,67 +65,39 @@ const deletedMessagesChatId   = DELETED_GROUP_CHAT_ID;
 
 console.log('Telegram bot is running...');
 
-// Function to get user's recent messages directly from Telegram
-async function getUserRecentMessages(chatId, userId, limit = 10) {
-  try {
-    console.log(`Getting last ${limit} messages from user ${userId} in chat ${chatId}`);
-    
-    const userMessages = [];
-    let offset = 0;
-    const batchSize = 100; // Get messages in batches
-    
-    // Search through recent messages to find messages from this user
-    while (userMessages.length < limit && offset < 1000) { // Limit search to last 1000 messages
-      try {
-        // Get recent messages from the chat
-        const updates = await bot.getUpdates({
-          offset: offset,
-          limit: batchSize
-        });
-        
-        if (!updates || updates.length === 0) break;
-        
-        // Filter messages from this chat and user
-        const matchingMessages = updates
-          .filter(update => 
-            update.message &&
-            update.message.chat &&
-            update.message.chat.id.toString() === chatId.toString() &&
-            update.message.from &&
-            update.message.from.id === userId &&
-            (update.message.text || update.message.caption) // Only text/caption messages
-          )
-          .map(update => update.message.text || update.message.caption);
-        
-        userMessages.push(...matchingMessages);
-        offset += batchSize;
-        
-        // If we didn't find any new messages in this batch, break
-        if (matchingMessages.length === 0) {
-          break;
-        }
-      } catch (apiError) {
-        console.log('Could not retrieve message history via getUpdates, using alternative approach');
-        break;
-      }
-    }
-    
-    // Take only the most recent messages up to the limit
-    const recentMessages = userMessages.slice(-limit);
-    
-    console.log(`Found ${recentMessages.length} recent messages from user`);
-    
-    if (recentMessages.length > 0) {
-      console.log(`User's recent messages: ${recentMessages.map(msg => `"${msg.substring(0, 50)}..."`).join(', ')}`);
-    }
-    
-    return recentMessages;
-    
-  } catch (error) {
-    console.error('Error getting user recent messages:', error);
-    console.log('Falling back to analyzing just the current message');
-    return []; // Return empty array if we can't get history
+// Simple in-memory storage for user messages
+const userMessageHistory = new Map(); // userId -> array of recent messages
+
+// Function to store user message
+function storeUserMessage(userId, messageContent) {
+  if (!userMessageHistory.has(userId)) {
+    userMessageHistory.set(userId, []);
   }
+  
+  const messages = userMessageHistory.get(userId);
+  messages.push({
+    content: messageContent,
+    timestamp: Date.now()
+  });
+  
+  // Keep only last 20 messages per user to avoid memory issues
+  if (messages.length > 20) {
+    messages.shift();
+  }
+}
+
+// Function to get user's recent messages from our storage
+function getUserRecentMessages(userId, limit = 10) {
+  const messages = userMessageHistory.get(userId) || [];
+  const recentMessages = messages.slice(-limit).map(msg => msg.content);
+  
+  console.log(`Found ${recentMessages.length} recent messages from user ${userId}`);
+  
+  if (recentMessages.length > 0) {
+    console.log(`User's recent messages: ${recentMessages.map(msg => `"${msg.substring(0, 50)}..."`).join(', ')}`);
+  }
+  
+  return recentMessages;
 }
 
 bot.on('message', async (msg) => {
@@ -118,9 +112,29 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // Skip messages from whitelisted users
+  if (WHITELIST_IDS.includes(msg.from.id)) {
+    console.log(`Message from WHITELISTED user (${msg.from.username || msg.from.first_name}), skipping moderation.`);
+    return;
+  }
+
   // ----- Handle stories/media posts -----
   if (msg.story) {
-    console.log('Message contains a story, marking for deletion and banning user.');
+    console.log('Message contains a story, checking user permissions...');
+
+    // Check if user is admin/creator before deleting story
+    try {
+      const chatMember = await bot.getChatMember(chatId, msg.from.id);
+      if (['administrator', 'creator', 'owner'].includes(chatMember.status)) {
+        console.log('Story is from an admin/creator, skipping deletion and banning.');
+        return;
+      }
+    } catch (error) {
+      console.error('Failed to check user permissions for story:', error);
+      // Continue with deletion if we can't check permissions
+    }
+
+    console.log('User is not an admin, marking story for deletion and banning user.');
 
     const storyChat    = msg.story.chat || {};
     const storyDetails = `Shared story from @${storyChat.username || 'unknown'}: "${storyChat.title || 'No Title'}"`;
@@ -160,30 +174,34 @@ bot.on('message', async (msg) => {
 
   console.log(`New message received from ${msg.from.username || msg.from.first_name}: ${messageContent}`);
 
-  // Get user's recent messages (up to 10) including the current one
-  const userMessages = await getUserRecentMessages(chatId, msg.from.id, 10);
-  
-  // Add the current message to the analysis (in case it wasn't captured in history)
-  if (!userMessages.includes(messageContent)) {
-    userMessages.push(messageContent);
+  // Check if user is admin/creator before analyzing message
+  try {
+    const chatMember = await bot.getChatMember(chatId, msg.from.id);
+    if (['administrator', 'creator', 'owner'].includes(chatMember.status)) {
+      console.log('Message is from an admin/creator, skipping moderation.');
+      return;
+    }
+  } catch (error) {
+    console.error('Failed to check user permissions:', error);
+    // Continue with moderation if we can't check permissions
   }
+
+  // Get user's recent messages (up to 9) BEFORE adding the current one
+  const previousMessages = getUserRecentMessages(msg.from.id, 9);
   
-  // Keep only the last 10 messages
-  const messagesToAnalyze = userMessages.slice(-10);
+  // Store the current message for this user
+  storeUserMessage(msg.from.id, messageContent);
+  
+  // Combine previous messages with current message for analysis
+  const messagesToAnalyze = [...previousMessages, messageContent];
 
   try {
-    const messageType = await retryDetectMessageType(messagesToAnalyze, 3);
+    const userName = msg.from.first_name || msg.from.username || 'Unknown';
+    const messageType = await retryDetectMessageType(messagesToAnalyze, userName, 3);
     console.log('User classification:', messageType);
     console.log(`Analyzed ${messagesToAnalyze.length} messages from user`);
 
     if (messageType === 'delete') {
-      // Skip admins/creator
-      const chatMember = await bot.getChatMember(chatId, msg.from.id);
-      if (['administrator', 'creator', 'owner'].includes(chatMember.status)) {
-        console.log('Message is from an admin/creator, skipping deletion and banning.');
-        return;
-      }
-
       console.log(`Attempting to delete message: ${messageContent}`);
       await bot.deleteMessage(chatId, messageId);
       console.log('Message deleted successfully');
@@ -208,15 +226,18 @@ bot.on('message', async (msg) => {
 });
 
 // Retry wrapper for analyzing user messages
-async function retryDetectMessageType(userMessages, retries) {
+async function retryDetectMessageType(userMessages, userName, retries) {
   let attempts = 0;
   while (attempts < retries) {
     attempts++;
     console.log(`Attempt ${attempts}: Analyzing ${userMessages.length} messages from user`);
     try {
-      const messageType = await detectMessageType(userMessages);
-      if (['delete', 'normal'].includes(messageType)) {
-        return messageType;
+      const messageType = await detectMessageType(userMessages, userName);
+      // Extract just 'delete' or 'normal' from the response
+      if (messageType.includes('delete')) {
+        return 'delete';
+      } else if (messageType.includes('normal')) {
+        return 'normal';
       }
       console.log(`Unexpected result: "${messageType}". Retrying...`);
     } catch (error) {
@@ -227,7 +248,7 @@ async function retryDetectMessageType(userMessages, retries) {
 }
 
 // OpenAI classification call analyzing all user messages
-async function detectMessageType(userMessages) {
+async function detectMessageType(userMessages, userName) {
   try {
     console.log(`Prompting OpenAI to analyze ${userMessages.length} messages from user`);
     
@@ -235,12 +256,12 @@ async function detectMessageType(userMessages) {
     let analysisContent;
     
     if (userMessages.length === 1) {
-      analysisContent = `Analyze this single message from the user: "${userMessages[0]}"`;
+      analysisContent = `User's display name: "${userName}"\n\nAnalyze this single message from the user: "${userMessages[0]}"\n\nPay special attention to impersonation attempts (users with official-sounding names offering private support).`;
     } else {
       const messagesText = userMessages
         .map((msg, index) => `${index + 1}. "${msg}"`)
         .join('\n');
-      analysisContent = `Analyze all these messages from the user (oldest to newest):\n\n${messagesText}\n\nBased on ALL these messages, determine if this user should be deleted/banned or is normal.`;
+      analysisContent = `User's display name: "${userName}"\n\nAnalyze all these messages from the user (oldest to newest):\n\n${messagesText}\n\nBased on ALL these messages and the user's display name, determine if this user should be deleted/banned or is normal. Pay special attention to impersonation attempts.`;
     }
     
     const completion = await openai.chat.completions.create({
@@ -259,6 +280,8 @@ IMPORTANT: Analyze the overall pattern of ALL messages:
 - If there's a mix but legitimate questions dominate, classify as "normal"
 - New users with only promotional content should be "delete"
 - Users with established legitimate conversation patterns should be "normal"
+- CRITICAL: Users impersonating official support (names like "NEAR Mobile", "Support", "Admin") offering private help should be "delete"
+- ANY message asking users to DM or contact privately for support should be "delete"
 
 Only classify as "delete" if you are absolutely sure the user is a spammer/scammer based on their message pattern. If you are unsure, classify as "normal".
 
@@ -271,6 +294,18 @@ Guidelines:
    - Content urging members to DM or interact outside the group
    - Messages mentioning specific financial instruments (e.g., TON, LTC, leverage)
    - Repeated promotional patterns in message history
+   - IMPERSONATION ATTEMPTS: Users pretending to be official support/staff
+   - Messages asking users to "DM me", "message me privately", "contact me directly"
+   - Fake support responses like "share your issue with me", "I will help you", "contact me for assistance"
+   - Users with names like "NEAR Mobile", "Support", "Admin", "Official" who are not actual staff
+   - Attempts to provide "customer support" or "technical assistance" via private messages
+   - CRYPTO GIVEAWAY/AIRDROP SCAMS: Any mention of free tokens, vouchers, airdrops, or rewards
+   - Messages promoting connecting wallets to external bots or websites
+   - Any mention of "eligible to receive", "minimum prize", "voucher lottery", "free USDC/tokens"
+   - Promotional content about bots (e.g., @usdcvouchersbot, @anytokenbot)
+   - Messages about "connecting your wallet", "complete steps to receive", "enter lottery"
+   - Any forwarded promotional content from channels/bots offering crypto rewards
+   - Claims about "guaranteed" crypto rewards, prizes, or distributions
 
 2. Classify as "normal" if the message:
    - Asks legitimate questions about the NEARMobile wallet, NEAR, NPRO or related issues
@@ -283,12 +318,25 @@ Examples of messages to classify as "delete":
 - "Trade: #BTC/USDT 🟢 LONG ZONE: 30,000 - 29,500 🀄️ LEVERAGE: 10x 🎯 Targets: 30,500, 31,000, 32,000 ⛔️ STOP-LOSS: 29,000"
 - "Sign up for guaranteed trading profits! DM me for more info."
 - "Earn $500/day with our proven trading system. DM for details!"
+- "Hello, directly share your issue with me while I attend to it."
+- "DM me for support with your wallet issues"
+- "Contact me privately and I'll help you recover your funds"
+- "I'm from NEAR support team, message me directly"
+- "Introducing USDC VOUCHERS - Any holder of a SOL wallet is eligible to receive at least 100 USDC"
+- "Connect your SOL wallet - Complete a few simple steps - You'll be automatically entered into the voucher lottery"
+- "Free airdrop! Connect your wallet to @anybotname to claim your tokens"
+- "Minimum prize is 500 USDC - Fair distribution - Immediate payouts"
+- "You are eligible to receive free tokens! Visit our bot @examplebot"
 
 Examples of messages to classify as "normal":
 - "How can I transfer funds using the NEARMobile wallet?"
 - "How can I earn NPRO tokens?"
 - "Is there a way to resolve a stuck transaction?"
 - "I have an issue logging into my NEARMobile wallet. Can anyone help?"
+
+CRITICAL IMPERSONATION CHECK: If the user's display name is "NEAR Mobile", "Support", "Admin", "Official" or similar AND they are asking users to contact them privately or share issues directly, this is 100% a scammer impersonating official support and should be "delete".
+
+CRITICAL CRYPTO SCAM CHECK: Any message promoting free crypto tokens, vouchers, airdrops, connecting wallets to bots, or "eligible to receive" crypto rewards is 100% a scam and should be "delete". These include USDC vouchers, token lotteries, wallet connection requests, and forwarded promotional content from crypto channels/bots.
 
 The prompt output can only be "delete" or "normal".
 `
